@@ -58,6 +58,46 @@
           <button id="clearButton" class="button subtle">Clear</button>
         </div>
 
+        <section class="llmSection">
+          <p class="sectionTitle">LLM Generation</p>
+          <div class="fields">
+            <label class="field">
+              <span class="fieldLabel">Base URL</span>
+              <input id="llmBaseUrlInput" class="fieldControl" type="text" placeholder="https://your-api-host/v1" />
+            </label>
+            <label class="field">
+              <span class="fieldLabel">API Key</span>
+              <input id="llmApiKeyInput" class="fieldControl" type="password" placeholder="sk-..." />
+            </label>
+            <label class="field">
+              <span class="fieldLabel">Model</span>
+              <input id="llmModelInput" class="fieldControl" type="text" placeholder="gpt-4.1-mini" />
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="generateButton" class="button primary">Generate Skill</button>
+            <button id="downloadJsonButton" class="button">Download JSON</button>
+            <button id="downloadMarkdownButton" class="button">Download Markdown</button>
+          </div>
+
+          <div id="generationStatus" class="generationStatus" hidden>
+            <span class="generationSpinner" aria-hidden="true"></span>
+            <span id="generationStatusText">Generating skill...</span>
+          </div>
+
+          <div id="generationError" class="generationError" hidden>
+            <p class="generationErrorTitle">Generation Failed</p>
+            <p id="generationErrorMessage" class="generationErrorMessage"></p>
+            <p id="generationErrorHint" class="generationErrorHint"></p>
+          </div>
+
+          <label class="field outputField">
+            <span class="fieldLabel">Generated Preview</span>
+            <textarea id="generatedOutput" class="fieldControl fieldControlTextarea outputControl" readonly></textarea>
+          </label>
+        </section>
+
         <p id="message" class="message"></p>
       </section>
     </main>

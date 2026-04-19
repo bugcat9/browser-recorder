@@ -1,0 +1,9 @@
+{
+  "name": "browser-skill-recorder",
+  "version": "0.2.0",
+  "private": true,
+  "scripts": {
+    "check": "node --check background.js && node --check content-script.js && node --check popup.js && node --check scripts/generate-skill.js",
+    "generate:skill": "node scripts/generate-skill.js"
+  }
+}

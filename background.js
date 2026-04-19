@@ -1,14 +1,64 @@
 ﻿const DEBUGGER_VERSION = "1.3";
 const STORAGE_KEY = "browserSkillRecorderState";
+const LLM_SETTINGS_KEY = "browserSkillRecorderLlmSettings";
+const GENERATED_SKILL_KEY = "browserSkillRecorderGeneratedSkill";
+const GENERATION_ERROR_KEY = "browserSkillRecorderGenerationError";
 const MAX_TEXT_LENGTH = 300;
 const SKILL_SCHEMA_VERSION = "2.0";
 const ZIP_TEXT_ENCODER = new TextEncoder();
 const CRC32_TABLE = buildCrc32Table();
+const DEFAULT_LLM_MODEL = "gpt-4.1-mini";
+const LLM_REQUEST_TIMEOUT_MS = 90000;
+const LLM_SYSTEM_PROMPT = `You are generating a reusable browser automation skill from a recorded browser session.
+
+Return JSON only. Do not use Markdown fences. Do not add commentary.
+
+The JSON must follow this shape exactly:
+
+{
+  "name": "string",
+  "description": "string",
+  "goal": "string",
+  "startUrl": "string",
+  "prerequisites": ["string"],
+  "steps": [
+    {
+      "id": "s0001",
+      "title": "short step title",
+      "action": "clear imperative instruction",
+      "target": "optional target description",
+      "value": "optional input value",
+      "expected": "optional expected result"
+    }
+  ],
+  "assertions": ["string"],
+  "fallback": ["string"],
+  "notes": ["string"]
+}
+
+Rules:
+
+- Use the recorded skill name and description when they are present.
+- Keep steps concise, deterministic, and directly actionable.
+- Prefer business-level actions over raw browser noise.
+- Use the normalized steps as the primary source of truth.
+- Use raw events only if they materially clarify an action or expected result.
+- Do not invent credentials, secrets, or internal data.
+- If a field is unknown, use an empty string or empty array instead of guessing.`;
 
 let state = {
   session: null,
   persistTimer: null,
   pendingDownloadFilename: null,
+  llmSettings: {
+    baseUrl: "",
+    apiKey: "",
+    model: DEFAULT_LLM_MODEL,
+  },
+  generatedSkill: null,
+  generationError: null,
+  generationInProgress: false,
+  generationStartedAt: null,
 };
 
 initialize().catch((error) => {
@@ -74,9 +124,30 @@ async function initialize() {
 }
 
 async function restoreState() {
-  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEY,
+    LLM_SETTINGS_KEY,
+    GENERATED_SKILL_KEY,
+    GENERATION_ERROR_KEY,
+  ]);
   if (stored[STORAGE_KEY]) {
     state.session = stored[STORAGE_KEY];
+  }
+
+  if (stored[LLM_SETTINGS_KEY]) {
+    state.llmSettings = {
+      baseUrl: stored[LLM_SETTINGS_KEY].baseUrl || "",
+      apiKey: stored[LLM_SETTINGS_KEY].apiKey || "",
+      model: stored[LLM_SETTINGS_KEY].model || DEFAULT_LLM_MODEL,
+    };
+  }
+
+  if (stored[GENERATED_SKILL_KEY]) {
+    state.generatedSkill = stored[GENERATED_SKILL_KEY];
+  }
+
+  if (stored[GENERATION_ERROR_KEY]) {
+    state.generationError = stored[GENERATION_ERROR_KEY];
   }
 }
 
@@ -198,6 +269,8 @@ function addEvent(type, payload = {}) {
 }
 
 function getSessionSummary() {
+  reconcileGenerationState();
+
   return {
     recording: isRecording(),
     sessionId: state.session?.id ?? null,
@@ -205,7 +278,47 @@ function getSessionSummary() {
     stoppedAt: state.session?.stoppedAt ?? null,
     eventCount: state.session?.events.length ?? 0,
     tabCount: state.session ? Object.keys(state.session.tabs).length : 0,
+    generationInProgress: state.generationInProgress,
+    hasGeneratedSkill: Boolean(state.generatedSkill),
   };
+}
+
+function buildPopupState() {
+  return {
+    summary: getSessionSummary(),
+    llmSettings: {
+      baseUrl: state.llmSettings.baseUrl,
+      apiKey: state.llmSettings.apiKey,
+      model: state.llmSettings.model || DEFAULT_LLM_MODEL,
+    },
+    generatedSkill: state.generatedSkill
+      ? {
+          name: state.generatedSkill.name,
+          generatedAt: state.generatedSkill.generatedAt,
+          model: state.generatedSkill.model,
+          markdown: state.generatedSkill.markdown,
+        }
+      : null,
+    generationError: state.generationError,
+  };
+}
+
+function reconcileGenerationState() {
+  if (!state.generationInProgress || !state.generationStartedAt) {
+    return;
+  }
+
+  const startedAtMs = Date.parse(state.generationStartedAt);
+  if (!Number.isFinite(startedAtMs)) {
+    state.generationInProgress = false;
+    state.generationStartedAt = null;
+    return;
+  }
+
+  if (Date.now() - startedAtMs > LLM_REQUEST_TIMEOUT_MS + 15000) {
+    state.generationInProgress = false;
+    state.generationStartedAt = null;
+  }
 }
 
 async function handleMessage(message, sender) {
@@ -214,30 +327,48 @@ async function handleMessage(message, sender) {
       await startRecording(message.payload);
       return {
         ok: true,
-        summary: getSessionSummary(),
+        ...buildPopupState(),
       };
     case "STOP_RECORDING":
       await stopRecording();
       return {
         ok: true,
-        summary: getSessionSummary(),
+        ...buildPopupState(),
       };
     case "EXPORT_RECORDING":
       await exportRecording();
       return {
         ok: true,
-        summary: getSessionSummary(),
+        ...buildPopupState(),
+      };
+    case "GENERATE_SKILL":
+      await generateSkill(message.payload);
+      return {
+        ok: true,
+        ...buildPopupState(),
+      };
+    case "DOWNLOAD_GENERATED_SKILL_JSON":
+      await downloadGeneratedSkillJson();
+      return {
+        ok: true,
+        ...buildPopupState(),
+      };
+    case "DOWNLOAD_GENERATED_SKILL_MARKDOWN":
+      await downloadGeneratedSkillMarkdown();
+      return {
+        ok: true,
+        ...buildPopupState(),
       };
     case "CLEAR_RECORDING":
       await clearRecording();
       return {
         ok: true,
-        summary: getSessionSummary(),
+        ...buildPopupState(),
       };
     case "GET_STATUS":
       return {
         ok: true,
-        summary: getSessionSummary(),
+        ...buildPopupState(),
       };
     case "RECORDER_DOM_EVENT":
       await recordDomEvent(message.payload, sender);
@@ -258,8 +389,11 @@ async function startRecording(payload = {}) {
   }
 
   state.session = createEmptySession();
+  state.generatedSkill = null;
+  state.generationError = null;
   state.session.metadata.skillName = normalizeUserText(payload.skillName, 120);
   state.session.metadata.skillDescription = normalizeUserText(payload.skillDescription, 400);
+  await chrome.storage.local.remove([GENERATED_SKILL_KEY, GENERATION_ERROR_KEY]);
 
   const [activeTab] = await chrome.tabs.query({
     active: true,
@@ -311,12 +445,16 @@ async function clearRecording() {
   }
 
   state.session = null;
+  state.generatedSkill = null;
+  state.generationError = null;
+  state.generationInProgress = false;
+  state.generationStartedAt = null;
   if (state.persistTimer) {
     clearTimeout(state.persistTimer);
     state.persistTimer = null;
   }
 
-  await chrome.storage.local.remove(STORAGE_KEY);
+  await chrome.storage.local.remove([STORAGE_KEY, GENERATED_SKILL_KEY, GENERATION_ERROR_KEY]);
 }
 
 async function exportRecording() {
@@ -334,6 +472,80 @@ async function exportRecording() {
     saveAs: true,
     conflictAction: "uniquify",
   });
+}
+
+async function generateSkill(payload = {}) {
+  const session = assertSession();
+  const llmSettings = {
+    baseUrl: normalizeUserText(payload.baseUrl, 500),
+    apiKey: normalizeUserText(payload.apiKey, 500),
+    model: normalizeUserText(payload.model, 120) || DEFAULT_LLM_MODEL,
+  };
+
+  if (!llmSettings.baseUrl || !llmSettings.apiKey) {
+    throw new Error("Base URL and API Key are required to generate a skill.");
+  }
+
+  state.llmSettings = llmSettings;
+  state.generationError = null;
+  state.generationInProgress = true;
+  state.generationStartedAt = nowIso();
+  await chrome.storage.local.set({
+    [LLM_SETTINGS_KEY]: state.llmSettings,
+  });
+
+  try {
+    const promptContext = buildLlmPromptContext(session);
+    const responseText = await requestGeneratedSkill(llmSettings, promptContext);
+    const skillJson = parseModelJson(responseText);
+    validateGeneratedSkill(skillJson);
+    const markdown = renderGeneratedSkillMarkdown(skillJson);
+
+    state.generatedSkill = {
+      name: skillJson.name,
+      model: llmSettings.model,
+      generatedAt: nowIso(),
+      json: skillJson,
+      markdown,
+      rawResponse: responseText,
+    };
+
+    await chrome.storage.local.set({
+      [GENERATED_SKILL_KEY]: state.generatedSkill,
+      [GENERATION_ERROR_KEY]: null,
+    });
+  } catch (error) {
+    state.generationError = {
+      message: error.message,
+      at: nowIso(),
+      hint: buildGenerationErrorHint(error.message),
+    };
+    await chrome.storage.local.set({
+      [GENERATION_ERROR_KEY]: state.generationError,
+    });
+    throw error;
+  } finally {
+    state.generationInProgress = false;
+    state.generationStartedAt = null;
+  }
+}
+
+async function downloadGeneratedSkillJson() {
+  if (!state.generatedSkill?.json) {
+    throw new Error("No generated skill is available.");
+  }
+
+  const fileName = `${sanitizeFileNameComponent(state.generatedSkill.name || "generated-skill")}.json`;
+  await downloadTextFile(JSON.stringify(state.generatedSkill.json, null, 2), fileName, "application/json");
+}
+
+async function downloadGeneratedSkillMarkdown() {
+  if (!state.generatedSkill?.markdown) {
+    throw new Error("No generated skill is available.");
+  }
+
+  const fileName = `${sanitizeFileNameComponent(state.generatedSkill.name || "generated-skill")}.md`;
+  await downloadTextFile(state.generatedSkill.markdown, fileName, "text/markdown");
 }
 
 async function trackTab(tabId, context = {}) {
@@ -667,6 +879,100 @@ function handleDeterminingFilename(item, suggest) {
   state.pendingDownloadFilename = null;
 }
 
+async function requestGeneratedSkill(llmSettings, promptContext) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort(new Error(`LLM request timed out after ${Math.round(LLM_REQUEST_TIMEOUT_MS / 1000)} seconds.`));
+  }, LLM_REQUEST_TIMEOUT_MS);
+
+  let response;
+
+  try {
+    response = await fetch(buildChatCompletionsUrl(llmSettings.baseUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${llmSettings.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: llmSettings.model,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "system",
+            content: LLM_SYSTEM_PROMPT,
+          },
+          {
+            role: "user",
+            content: JSON.stringify(promptContext, null, 2),
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`LLM request timed out after ${Math.round(LLM_REQUEST_TIMEOUT_MS / 1000)} seconds.`);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`LLM request failed (${response.status}): ${errorText}`);
+  }
+
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== "string" || !content.trim()) {
+    throw new Error("LLM response did not contain message content.");
+  }
+
+  return content;
+}
+
+function buildChatCompletionsUrl(baseUrl) {
+  const trimmed = String(baseUrl).replace(/\/+$/, "");
+  if (trimmed.endsWith("/chat/completions")) {
+    return trimmed;
+  }
+
+  return `${trimmed}/chat/completions`;
+}
+
+function buildGenerationErrorHint(message) {
+  const text = String(message || "").toLowerCase();
+
+  if (text.includes("timed out")) {
+    return "The model endpoint did not respond in time. Check network reachability, model latency, or try a faster model.";
+  }
+
+  if (text.includes("(401)") || text.includes("(403)") || text.includes("unauthorized")) {
+    return "Authentication failed. Verify the API key and whether the provider expects a different auth header or project scope.";
+  }
+
+  if (text.includes("(404)")) {
+    return "The endpoint path may be wrong. Verify the Base URL and whether /chat/completions is supported by this provider.";
+  }
+
+  if (text.includes("(400)")) {
+    return "The provider rejected the request format. Check model name, endpoint compatibility, and whether the API is OpenAI-compatible.";
+  }
+
+  if (text.includes("failed to fetch") || text.includes("network")) {
+    return "The request could not reach the provider. Check the Base URL, network access, and provider availability.";
+  }
+
+  if (text.includes("could not parse json") || text.includes("did not contain message content")) {
+    return "The provider returned an unexpected response shape. It may not be fully compatible with OpenAI chat completions.";
+  }
+
+  return "Check the Base URL, API key, model name, and whether the provider supports OpenAI-style chat completions.";
+}
+
 function simplifyHeaders(headers) {
   if (!headers || typeof headers !== "object") {
     return {};
@@ -721,6 +1027,18 @@ function buildSkillPackage(session) {
     index,
     steps,
     rawEvents,
+  };
+}
+
+function buildLlmPromptContext(session) {
+  const artifacts = buildSkillPackage(session);
+
+  return {
+    meta: artifacts.meta,
+    index: artifacts.index,
+    stepMarkdown: artifacts.files.find((file) => file.name.endsWith("step.llm.md"))?.content || "",
+    steps: artifacts.steps,
+    raw: artifacts.rawEvents.slice(0, 20),
   };
 }
 
@@ -1326,4 +1644,123 @@ async function blobToDataUrl(blob) {
   }
 
   return `data:${blob.type || "application/octet-stream"};base64,${btoa(binary)}`;
+}
+
+async function downloadTextFile(content, fileName, mimeType) {
+  const dataUrl = `data:${mimeType};charset=utf-8,${encodeURIComponent(content)}`;
+  state.pendingDownloadFilename = fileName;
+
+  await chrome.downloads.download({
+    url: dataUrl,
+    filename: fileName,
+    saveAs: true,
+    conflictAction: "uniquify",
+  });
+}
+
+function parseModelJson(text) {
+  const direct = tryParseJson(text);
+  if (direct) {
+    return direct;
+  }
+
+  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fencedMatch) {
+    const parsed = tryParseJson(fencedMatch[1]);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    const parsed = tryParseJson(text.slice(start, end + 1));
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  throw new Error("Could not parse JSON from LLM response.");
+}
+
+function tryParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function validateGeneratedSkill(skill) {
+  const requiredStrings = ["name", "description", "goal", "startUrl"];
+  for (const key of requiredStrings) {
+    if (typeof skill?.[key] !== "string") {
+      throw new Error(`Generated skill is missing required string field: ${key}`);
+    }
+  }
+
+  const requiredArrays = ["prerequisites", "steps", "assertions", "fallback", "notes"];
+  for (const key of requiredArrays) {
+    if (!Array.isArray(skill?.[key])) {
+      throw new Error(`Generated skill is missing required array field: ${key}`);
+    }
+  }
+}
+
+function renderGeneratedSkillMarkdown(skill) {
+  const lines = [
+    `# ${skill.name}`,
+    "",
+    skill.description,
+    "",
+    `Goal: ${skill.goal}`,
+    `Start URL: ${skill.startUrl || "N/A"}`,
+    "",
+    "## Prerequisites",
+    ...renderMarkdownList(skill.prerequisites),
+    "",
+    "## Steps",
+    ...renderGeneratedSkillSteps(skill.steps),
+    "",
+    "## Assertions",
+    ...renderMarkdownList(skill.assertions),
+    "",
+    "## Fallback",
+    ...renderMarkdownList(skill.fallback),
+    "",
+    "## Notes",
+    ...renderMarkdownList(skill.notes),
+  ];
+
+  return lines.join("\n");
+}
+
+function renderMarkdownList(items) {
+  if (!items || items.length === 0) {
+    return ["- None"];
+  }
+
+  return items.map((item) => `- ${String(item)}`);
+}
+
+function renderGeneratedSkillSteps(steps) {
+  if (!steps || steps.length === 0) {
+    return ["1. No steps generated"];
+  }
+
+  return steps.map((step, index) => {
+    const parts = [step.action || step.title || `Step ${index + 1}`];
+    if (step.target) {
+      parts.push(`Target: ${step.target}`);
+    }
+    if (step.value) {
+      parts.push(`Value: ${step.value}`);
+    }
+    if (step.expected) {
+      parts.push(`Expected: ${step.expected}`);
+    }
+
+    return `${index + 1}. ${parts.join(" | ")}`;
+  });
 }

@@ -112,6 +112,61 @@ skill-name-1a2b3c4d/
 
 这样可以显著减少上下文噪音，避免把大量底层网络和 DOM 事件直接塞给 LLM。
 
+## LLM 生成 Skill
+
+仓库现在支持两种方式生成 skill：
+
+1. 在扩展 popup 里直接生成
+2. 用本地 CLI 处理解压后的录制目录
+
+### 在 Popup 中直接生成
+
+在录制完成后：
+
+1. 打开扩展 popup
+2. 在 `LLM Generation` 区域填写：
+   - `Base URL`
+   - `API Key`
+   - `Model`
+3. 点击 `Generate Skill`
+4. 生成结果会显示在 popup 的 `Generated Preview`
+5. 也可以直接下载：
+   - `Download JSON`
+   - `Download Markdown`
+
+说明：
+
+- `Base URL` 采用 OpenAI 风格接口，脚本会自动补成 `/chat/completions`
+- `API Key` 和 `Model` 会保存在扩展本地存储中，方便下次继续使用
+
+### 使用本地 CLI
+
+先设置环境变量：
+
+```powershell
+$env:LLM_BASE_URL="https://your-api-host/v1"
+$env:LLM_API_KEY="your-key"
+$env:LLM_MODEL="gpt-4.1-mini"
+```
+
+然后执行：
+
+```powershell
+node scripts/generate-skill.js --input .\path\to\exported-skill-folder
+```
+
+生成结果会写到录制目录下的 `generated/`：
+
+- `generated/skill.json`
+- `generated/skill.md`
+- `generated/llm-response.txt`
+
+如果你只想先看 prompt，不真正调用接口：
+
+```powershell
+node scripts/generate-skill.js --input .\path\to\exported-skill-folder --dry-run
+```
+
 ## 已知限制
 
 - 无法录制 `chrome://`、Chrome Web Store、扩展页等受限页面
