@@ -8,6 +8,7 @@ const CRC32_TABLE = buildCrc32Table();
 let state = {
   session: null,
   persistTimer: null,
+  pendingDownloadFilename: null,
 };
 
 initialize().catch((error) => {
@@ -62,6 +63,10 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
   void handleWindowFocusChanged(windowId);
+});
+
+chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+  handleDeterminingFilename(item, suggest);
 });
 
 async function initialize() {
@@ -319,10 +324,13 @@ async function exportRecording() {
   const skillPackage = buildSkillPackage(session);
   const zipBlob = createZipBlob(skillPackage.files);
   const dataUrl = await blobToDataUrl(zipBlob);
+  const downloadFileName = `${sanitizeFileNameComponent(skillPackage.meta.name || skillPackage.rootFolder)}.zip`;
+
+  state.pendingDownloadFilename = downloadFileName;
 
   await chrome.downloads.download({
     url: dataUrl,
-    filename: `${skillPackage.rootFolder}.zip`,
+    filename: downloadFileName,
     saveAs: true,
     conflictAction: "uniquify",
   });
@@ -641,6 +649,22 @@ async function handleWindowFocusChanged(windowId) {
   addEvent("window_focus_changed", {
     windowId,
   });
+}
+
+function handleDeterminingFilename(item, suggest) {
+  if (!state.pendingDownloadFilename) {
+    return;
+  }
+
+  if (item.byExtensionId !== chrome.runtime.id) {
+    return;
+  }
+
+  suggest({
+    filename: state.pendingDownloadFilename,
+    conflictAction: "uniquify",
+  });
+  state.pendingDownloadFilename = null;
 }
 
 function simplifyHeaders(headers) {
@@ -1065,8 +1089,7 @@ function buildStepMarkdown(meta, steps) {
 }
 
 function buildSkillFolderName(meta, sessionId) {
-  const slug = slugify(meta.name || "browser-skill");
-  return `${slug}-${sessionId.slice(0, 8)}`;
+  return sanitizeFileNameComponent(meta.name || `Browser Skill ${sessionId.slice(0, 8)}`);
 }
 
 function buildSkillName(startTitle, startUrl, sessionId) {
@@ -1143,6 +1166,50 @@ function cloneSerializable(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function sanitizeFileNameComponent(value) {
+  const cleaned = String(value)
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[. ]+$/g, "")
+    .slice(0, 120);
+
+  if (!cleaned) {
+    return "Browser Skill";
+  }
+
+  const reservedNames = new Set([
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+  ]);
+
+  if (reservedNames.has(cleaned.toUpperCase())) {
+    return `Skill ${cleaned}`;
+  }
+
+  return cleaned;
+}
+
 function normalizeUserText(value, maxLength) {
   if (typeof value !== "string") {
     return "";
@@ -1154,6 +1221,7 @@ function createZipBlob(files) {
   const localParts = [];
   const centralParts = [];
   let offset = 0;
+  const utf8Flag = 0x0800;
 
   for (const file of files) {
     const nameBytes = ZIP_TEXT_ENCODER.encode(file.name);
@@ -1164,7 +1232,7 @@ function createZipBlob(files) {
 
     localView.setUint32(0, 0x04034b50, true);
     localView.setUint16(4, 20, true);
-    localView.setUint16(6, 0, true);
+    localView.setUint16(6, utf8Flag, true);
     localView.setUint16(8, 0, true);
     localView.setUint16(10, 0, true);
     localView.setUint16(12, 0, true);
@@ -1182,7 +1250,7 @@ function createZipBlob(files) {
     centralView.setUint32(0, 0x02014b50, true);
     centralView.setUint16(4, 20, true);
     centralView.setUint16(6, 20, true);
-    centralView.setUint16(8, 0, true);
+    centralView.setUint16(8, utf8Flag, true);
     centralView.setUint16(10, 0, true);
     centralView.setUint16(12, 0, true);
     centralView.setUint16(14, 0, true);
