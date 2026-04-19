@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Browser Skill Recorder</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <section class="panel">
+        <p class="eyebrow">Browser Skill Recorder</p>
+        <h1>Capture browser behavior as a skill package</h1>
+        <p class="description">
+          Records DOM interaction events, CDP network activity, tab switching, and tab lifecycle events.
+        </p>
+
+        <div class="fields">
+          <label class="field">
+            <span class="fieldLabel">Skill Name</span>
+            <input id="skillNameInput" class="fieldControl" type="text" placeholder="Login to dashboard" maxlength="120" />
+          </label>
+          <label class="field">
+            <span class="fieldLabel">Skill Purpose</span>
+            <textarea
+              id="skillDescriptionInput"
+              class="fieldControl fieldControlTextarea"
+              placeholder="Describe what this skill helps the LLM accomplish."
+              maxlength="400"
+              rows="3"
+            ></textarea>
+          </label>
+        </div>
+
+        <dl class="stats">
+          <div class="stat">
+            <dt>Status</dt>
+            <dd id="statusValue">Idle</dd>
+          </div>
+          <div class="stat">
+            <dt>Session</dt>
+            <dd id="sessionValue">None</dd>
+          </div>
+          <div class="stat">
+            <dt>Events</dt>
+            <dd id="eventValue">0</dd>
+          </div>
+          <div class="stat">
+            <dt>Tabs</dt>
+            <dd id="tabValue">0</dd>
+          </div>
+        </dl>
+
+        <div class="actions">
+          <button id="startButton" class="button primary">Start</button>
+          <button id="stopButton" class="button">Stop</button>
+          <button id="exportButton" class="button">Export Skill</button>
+          <button id="clearButton" class="button subtle">Clear</button>
+        </div>
+
+        <p id="message" class="message"></p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
