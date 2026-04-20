@@ -1,4 +1,12 @@
-﻿const DEBUGGER_VERSION = "1.3";
+importScripts(
+  "lib/common.js",
+  "lib/steps.js",
+  "lib/prompt-privacy.js",
+  "lib/skill-package.js",
+  "lib/generation-utils.js"
+);
+
+const DEBUGGER_VERSION = "1.3";
 const STORAGE_KEY = "browserSkillRecorderState";
 const LLM_SETTINGS_KEY = "browserSkillRecorderLlmSettings";
 const GENERATED_SKILL_KEY = "browserSkillRecorderGeneratedSkill";
@@ -8,43 +16,28 @@ const SKILL_SCHEMA_VERSION = "2.0";
 const ZIP_TEXT_ENCODER = new TextEncoder();
 const CRC32_TABLE = buildCrc32Table();
 const DEFAULT_LLM_MODEL = "gpt-4.1-mini";
+const DEFAULT_SAFE_MODE = true;
 const LLM_REQUEST_TIMEOUT_MS = 90000;
-const LLM_SYSTEM_PROMPT = `You are generating a reusable browser automation skill from a recorded browser session.
 
-Return JSON only. Do not use Markdown fences. Do not add commentary.
+const {
+  normalizeUserText,
+  sanitizeFileNameComponent,
+  truncateText,
+} = globalThis.BSRCommon;
+const {
+  buildPromptPreviewText,
+} = globalThis.BSRPromptPrivacy;
+const {
+  buildLlmPromptContext,
+  buildSkillPackage,
+} = globalThis.BSRSkillPackage;
+const {
+  parseModelJson,
+  renderGeneratedSkillMarkdown,
+  validateGeneratedSkill,
+} = globalThis.BSRGenerationUtils;
 
-The JSON must follow this shape exactly:
-
-{
-  "name": "string",
-  "description": "string",
-  "goal": "string",
-  "startUrl": "string",
-  "prerequisites": ["string"],
-  "steps": [
-    {
-      "id": "s0001",
-      "title": "short step title",
-      "action": "clear imperative instruction",
-      "target": "optional target description",
-      "value": "optional input value",
-      "expected": "optional expected result"
-    }
-  ],
-  "assertions": ["string"],
-  "fallback": ["string"],
-  "notes": ["string"]
-}
-
-Rules:
-
-- Use the recorded skill name and description when they are present.
-- Keep steps concise, deterministic, and directly actionable.
-- Prefer business-level actions over raw browser noise.
-- Use the normalized steps as the primary source of truth.
-- Use raw events only if they materially clarify an action or expected result.
-- Do not invent credentials, secrets, or internal data.
-- If a field is unknown, use an empty string or empty array instead of guessing.`;
+let systemPromptCache = null;
 
 let state = {
   session: null,
@@ -54,6 +47,7 @@ let state = {
     baseUrl: "",
     apiKey: "",
     model: DEFAULT_LLM_MODEL,
+    safeMode: DEFAULT_SAFE_MODE,
   },
   generatedSkill: null,
   generationError: null,
@@ -121,6 +115,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 
 async function initialize() {
   await restoreState();
+  void loadSystemPrompt();
 }
 
 async function restoreState() {
@@ -130,6 +125,7 @@ async function restoreState() {
     GENERATED_SKILL_KEY,
     GENERATION_ERROR_KEY,
   ]);
+
   if (stored[STORAGE_KEY]) {
     state.session = stored[STORAGE_KEY];
   }
@@ -139,6 +135,7 @@ async function restoreState() {
       baseUrl: stored[LLM_SETTINGS_KEY].baseUrl || "",
       apiKey: stored[LLM_SETTINGS_KEY].apiKey || "",
       model: stored[LLM_SETTINGS_KEY].model || DEFAULT_LLM_MODEL,
+      safeMode: stored[LLM_SETTINGS_KEY].safeMode !== false,
     };
   }
 
@@ -242,18 +239,6 @@ function maybeSeedStartContextFromTab(tab) {
   }
 }
 
-function truncateText(value, maxLength = MAX_TEXT_LENGTH) {
-  if (typeof value !== "string") {
-    return value ?? null;
-  }
-
-  if (value.length <= maxLength) {
-    return value;
-  }
-
-  return `${value.slice(0, maxLength)}...`;
-}
-
 function addEvent(type, payload = {}) {
   if (!state.session) {
     return;
@@ -290,6 +275,7 @@ function buildPopupState() {
       baseUrl: state.llmSettings.baseUrl,
       apiKey: state.llmSettings.apiKey,
       model: state.llmSettings.model || DEFAULT_LLM_MODEL,
+      safeMode: state.llmSettings.safeMode !== false,
     },
     generatedSkill: state.generatedSkill
       ? {
@@ -358,6 +344,11 @@ async function handleMessage(message, sender) {
       return {
         ok: true,
         ...buildPopupState(),
+      };
+    case "GET_PROMPT_PREVIEW":
+      return {
+        ok: true,
+        promptPreview: buildPromptPreview(message.payload),
       };
     case "CLEAR_RECORDING":
       await clearRecording();
@@ -459,7 +450,9 @@ async function clearRecording() {
 
 async function exportRecording() {
   const session = assertSession();
-  const skillPackage = buildSkillPackage(session);
+  const skillPackage = buildSkillPackage(session, {
+    schemaVersion: SKILL_SCHEMA_VERSION,
+  });
   const zipBlob = createZipBlob(skillPackage.files);
   const dataUrl = await blobToDataUrl(zipBlob);
   const downloadFileName = `${sanitizeFileNameComponent(skillPackage.meta.name || skillPackage.rootFolder)}.zip`;
@@ -480,6 +473,7 @@ async function generateSkill(payload = {}) {
     baseUrl: normalizeUserText(payload.baseUrl, 500),
     apiKey: normalizeUserText(payload.apiKey, 500),
     model: normalizeUserText(payload.model, 120) || DEFAULT_LLM_MODEL,
+    safeMode: payload.safeMode !== false,
   };
 
   if (!llmSettings.baseUrl || !llmSettings.apiKey) {
@@ -495,7 +489,13 @@ async function generateSkill(payload = {}) {
   });
 
   try {
-    const promptContext = buildLlmPromptContext(session);
+    const promptContext = buildLlmPromptContext(session, {
+      schemaVersion: SKILL_SCHEMA_VERSION,
+      safeMode: llmSettings.safeMode,
+      rawSelection: {
+        limit: 30,
+      },
+    });
     const responseText = await requestGeneratedSkill(llmSettings, promptContext);
     const skillJson = parseModelJson(responseText);
     validateGeneratedSkill(skillJson);
@@ -546,6 +546,32 @@ async function downloadGeneratedSkillMarkdown() {
 
   const fileName = `${sanitizeFileNameComponent(state.generatedSkill.name || "generated-skill")}.md`;
   await downloadTextFile(state.generatedSkill.markdown, fileName, "text/markdown");
+}
+
+function buildPromptPreview(payload = {}) {
+  if (!state.session) {
+    return {
+      safeMode: payload.safeMode !== false,
+      rawCount: 0,
+      stepCount: 0,
+      previewText: "No recording session yet.",
+    };
+  }
+
+  const promptContext = buildLlmPromptContext(state.session, {
+    schemaVersion: SKILL_SCHEMA_VERSION,
+    safeMode: payload.safeMode !== false,
+    rawSelection: {
+      limit: 30,
+    },
+  });
+
+  return {
+    safeMode: payload.safeMode !== false,
+    rawCount: promptContext.raw.length,
+    stepCount: Array.isArray(promptContext.steps) ? promptContext.steps.length : 0,
+    previewText: buildPromptPreviewText(promptContext),
+  };
 }
 
 async function trackTab(tabId, context = {}) {
@@ -660,6 +686,7 @@ async function recordDomEvent(payload, sender) {
     extra: payload.extra ?? null,
   });
 }
+
 async function handleDebuggerEvent(source, method, params) {
   if (!isRecording() || !source.tabId) {
     return;
@@ -880,6 +907,7 @@ function handleDeterminingFilename(item, suggest) {
 }
 
 async function requestGeneratedSkill(llmSettings, promptContext) {
+  const systemPrompt = await loadSystemPrompt();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     controller.abort(new Error(`LLM request timed out after ${Math.round(LLM_REQUEST_TIMEOUT_MS / 1000)} seconds.`));
@@ -900,7 +928,7 @@ async function requestGeneratedSkill(llmSettings, promptContext) {
         messages: [
           {
             role: "system",
-            content: LLM_SYSTEM_PROMPT,
+            content: systemPrompt,
           },
           {
             role: "user",
@@ -932,6 +960,20 @@ async function requestGeneratedSkill(llmSettings, promptContext) {
   }
 
   return content;
+}
+
+async function loadSystemPrompt() {
+  if (systemPromptCache) {
+    return systemPromptCache;
+  }
+
+  const response = await fetch(chrome.runtime.getURL("prompts/skill-generator.md"));
+  if (!response.ok) {
+    throw new Error(`Failed to load prompt template (${response.status}).`);
+  }
+
+  systemPromptCache = await response.text();
+  return systemPromptCache;
 }
 
 function buildChatCompletionsUrl(baseUrl) {
@@ -990,551 +1032,6 @@ function simplifyHeaders(headers) {
   return result;
 }
 
-function buildSkillPackage(session) {
-  const rawEvents = buildRawEvents(session.events);
-  const steps = normalizeSteps(session, rawEvents);
-  const meta = buildSkillMeta(session, steps);
-  const index = buildSkillIndex(session, meta, steps, rawEvents);
-  const stepMarkdown = buildStepMarkdown(meta, steps);
-  const folderName = buildSkillFolderName(meta, session.id);
-  const files = [
-    {
-      name: `${folderName}/meta.json`,
-      content: JSON.stringify(meta, null, 2),
-    },
-    {
-      name: `${folderName}/index.json`,
-      content: JSON.stringify(index, null, 2),
-    },
-    {
-      name: `${folderName}/step.llm.md`,
-      content: stepMarkdown,
-    },
-    ...steps.map((step) => ({
-      name: `${folderName}/${step.stepFile}`,
-      content: JSON.stringify(step, null, 2),
-    })),
-    ...rawEvents.map((rawEvent) => ({
-      name: `${folderName}/${rawEvent.rawFile}`,
-      content: JSON.stringify(rawEvent, null, 2),
-    })),
-  ];
-
-  return {
-    rootFolder: folderName,
-    files,
-    meta,
-    index,
-    steps,
-    rawEvents,
-  };
-}
-
-function buildLlmPromptContext(session) {
-  const artifacts = buildSkillPackage(session);
-
-  return {
-    meta: artifacts.meta,
-    index: artifacts.index,
-    stepMarkdown: artifacts.files.find((file) => file.name.endsWith("step.llm.md"))?.content || "",
-    steps: artifacts.steps,
-    raw: artifacts.rawEvents.slice(0, 20),
-  };
-}
-
-function buildRawEvents(events) {
-  return events.map((event, index) => {
-    const rawEventId = `e${String(index + 1).padStart(4, "0")}`;
-    return {
-      id: rawEventId,
-      order: index + 1,
-      rawFile: `raw/${rawEventId}.json`,
-      ...cloneSerializable(event),
-    };
-  });
-}
-function normalizeSteps(session, rawEvents) {
-  const steps = [];
-  const lastMainFrameUrlByTab = new Map();
-  let lastActiveTabId = null;
-
-  for (let index = 0; index < rawEvents.length; index += 1) {
-    const rawEvent = rawEvents[index];
-
-    switch (rawEvent.type) {
-      case "session_started":
-        if (session.metadata.startUrl || session.metadata.startTitle) {
-          pushStep(steps, {
-            type: "navigate",
-            timestamp: rawEvent.timestamp,
-            tabId: session.metadata.startTabId,
-            url: session.metadata.startUrl,
-            title: session.metadata.startTitle,
-            tip: `Open ${formatUrlForTip(session.metadata.startUrl)}`,
-            rawEventIds: [rawEvent.id],
-            detail: {
-              title: session.metadata.startTitle || null,
-              targetUrl: session.metadata.startUrl || null,
-            },
-          });
-        }
-        break;
-      case "page_frame_navigated":
-        if (!rawEvent.frame || rawEvent.frame.parentId || !rawEvent.frame.url) {
-          break;
-        }
-
-        if (lastMainFrameUrlByTab.get(rawEvent.tabId) === rawEvent.frame.url) {
-          break;
-        }
-
-        lastMainFrameUrlByTab.set(rawEvent.tabId, rawEvent.frame.url);
-        pushStep(steps, {
-          type: "navigate",
-          timestamp: rawEvent.timestamp,
-          tabId: rawEvent.tabId,
-          url: rawEvent.frame.url,
-          title: findTitleForTab(session, rawEvent.tabId),
-          tip: `Navigate to ${formatUrlForTip(rawEvent.frame.url)}`,
-          rawEventIds: [rawEvent.id],
-          detail: {
-            frameId: rawEvent.frame.id ?? null,
-            loaderId: rawEvent.frame.loaderId ?? null,
-          },
-        });
-        break;
-      case "dom_click":
-        pushStep(steps, {
-          type: "click",
-          timestamp: rawEvent.timestamp,
-          tabId: rawEvent.tabId,
-          url: rawEvent.url,
-          title: rawEvent.title,
-          tip: `Click ${describeElementForTip(rawEvent.element)}`,
-          rawEventIds: [rawEvent.id],
-          detail: {
-            element: rawEvent.element ?? null,
-            coordinates: rawEvent.extra ?? null,
-          },
-        });
-        break;
-      case "dom_input":
-        if (!shouldSkipInputBecauseChangeExists(rawEvents, index)) {
-          pushInputStep(steps, rawEvent);
-        }
-        break;
-      case "dom_change":
-        pushInputStep(steps, rawEvent);
-        break;
-      case "dom_submit":
-        pushStep(steps, {
-          type: "submit",
-          timestamp: rawEvent.timestamp,
-          tabId: rawEvent.tabId,
-          url: rawEvent.url,
-          title: rawEvent.title,
-          tip: `Submit ${describeElementForTip(rawEvent.element)}`,
-          rawEventIds: [rawEvent.id],
-          detail: {
-            element: rawEvent.element ?? null,
-          },
-        });
-        break;
-      case "tab_created":
-        pushStep(steps, {
-          type: "open_tab",
-          timestamp: rawEvent.timestamp,
-          tabId: rawEvent.tabId,
-          url: rawEvent.url,
-          title: rawEvent.title,
-          tip: rawEvent.url ? `Open a new tab for ${formatUrlForTip(rawEvent.url)}` : "Open a new tab",
-          rawEventIds: [rawEvent.id],
-          detail: {
-            openerTabId: rawEvent.openerTabId ?? null,
-          },
-        });
-        break;
-      case "tab_activated":
-        if (lastActiveTabId !== rawEvent.tabId) {
-          lastActiveTabId = rawEvent.tabId;
-          pushStep(steps, {
-            type: "switch_tab",
-            timestamp: rawEvent.timestamp,
-            tabId: rawEvent.tabId,
-            url: findUrlForTab(session, rawEvent.tabId),
-            title: findTitleForTab(session, rawEvent.tabId),
-            tip: `Switch to tab ${describeTabForTip(session, rawEvent.tabId)}`,
-            rawEventIds: [rawEvent.id],
-            detail: {
-              windowId: rawEvent.windowId ?? null,
-            },
-          });
-        }
-        break;
-      case "tab_removed":
-        pushStep(steps, {
-          type: "close_tab",
-          timestamp: rawEvent.timestamp,
-          tabId: rawEvent.tabId,
-          url: findUrlForTab(session, rawEvent.tabId),
-          title: findTitleForTab(session, rawEvent.tabId),
-          tip: `Close tab ${describeTabForTip(session, rawEvent.tabId)}`,
-          rawEventIds: [rawEvent.id],
-          detail: {
-            windowId: rawEvent.windowId ?? null,
-            isWindowClosing: rawEvent.isWindowClosing ?? false,
-          },
-        });
-        break;
-      default:
-        break;
-    }
-  }
-
-  return renumberSteps(dedupeNavigateSteps(steps));
-}
-
-function pushInputStep(steps, rawEvent) {
-  const inputMode = inferInputMode(rawEvent);
-  const elementLabel = describeElementForTip(rawEvent.element);
-  const detail = {
-    element: rawEvent.element ?? null,
-    value: rawEvent.value ?? null,
-    checked: rawEvent.checked ?? null,
-  };
-
-  let type = "input";
-  let tip = `Type into ${elementLabel}`;
-
-  if (inputMode === "select") {
-    type = "select";
-    tip = rawEvent.value ? `Select "${rawEvent.value}" in ${elementLabel}` : `Select an option in ${elementLabel}`;
-  } else if (inputMode === "check") {
-    type = rawEvent.checked ? "check" : "uncheck";
-    tip = `${rawEvent.checked ? "Check" : "Uncheck"} ${elementLabel}`;
-  } else if (rawEvent.value) {
-    tip = `Type "${truncateText(rawEvent.value, 80)}" into ${elementLabel}`;
-  }
-
-  pushStep(steps, {
-    type,
-    timestamp: rawEvent.timestamp,
-    tabId: rawEvent.tabId,
-    url: rawEvent.url,
-    title: rawEvent.title,
-    tip,
-    rawEventIds: [rawEvent.id],
-    detail,
-  });
-}
-
-function pushStep(steps, step) {
-  const lastStep = steps[steps.length - 1];
-  if (lastStep && isDuplicateStep(lastStep, step)) {
-    lastStep.rawEventIds = Array.from(new Set([...lastStep.rawEventIds, ...step.rawEventIds]));
-    return lastStep;
-  }
-
-  const stepId = `s${String(steps.length + 1).padStart(4, "0")}`;
-  const fullStep = {
-    id: stepId,
-    stepFile: `steps/${stepId}.json`,
-    ...step,
-  };
-
-  steps.push(fullStep);
-  return fullStep;
-}
-
-function isDuplicateStep(previous, next) {
-  return previous.type === next.type && previous.tabId === next.tabId && previous.url === next.url && previous.tip === next.tip;
-}
-
-function dedupeNavigateSteps(steps) {
-  const result = [];
-
-  for (const step of steps) {
-    const previous = result[result.length - 1];
-    if (
-      previous &&
-      previous.type === "navigate" &&
-      step.type === "navigate" &&
-      previous.tabId === step.tabId &&
-      previous.url === step.url
-    ) {
-      previous.rawEventIds = Array.from(new Set([...previous.rawEventIds, ...step.rawEventIds]));
-      continue;
-    }
-
-    result.push(step);
-  }
-
-  return result;
-}
-
-function renumberSteps(steps) {
-  return steps.map((step, index) => {
-    const stepId = `s${String(index + 1).padStart(4, "0")}`;
-    return {
-      ...step,
-      id: stepId,
-      stepFile: `steps/${stepId}.json`,
-    };
-  });
-}
-
-function shouldSkipInputBecauseChangeExists(rawEvents, index) {
-  const current = rawEvents[index];
-  const currentTime = Date.parse(current.timestamp);
-
-  for (let lookAhead = index + 1; lookAhead < rawEvents.length && lookAhead <= index + 5; lookAhead += 1) {
-    const next = rawEvents[lookAhead];
-    const nextTime = Date.parse(next.timestamp);
-    if (Number.isFinite(currentTime) && Number.isFinite(nextTime) && nextTime - currentTime > 2000) {
-      break;
-    }
-
-    if (
-      next.type === "dom_change" &&
-      next.tabId === current.tabId &&
-      sameElementReference(next.element, current.element) &&
-      next.value === current.value &&
-      next.checked === current.checked
-    ) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function sameElementReference(left, right) {
-  if (!left || !right) {
-    return false;
-  }
-
-  return left.selector === right.selector && left.id === right.id && left.name === right.name && left.tagName === right.tagName;
-}
-
-function inferInputMode(rawEvent) {
-  const tagName = rawEvent.element?.tagName ?? "";
-  const elementType = rawEvent.element?.type ?? "";
-
-  if (tagName === "select") {
-    return "select";
-  }
-
-  if (elementType === "checkbox" || elementType === "radio") {
-    return "check";
-  }
-
-  return "input";
-}
-function buildSkillMeta(session, steps) {
-  const startUrl = session.metadata.startUrl || steps.find((step) => step.url)?.url || "";
-  const startTitle = session.metadata.startTitle || steps.find((step) => step.title)?.title || "";
-  const inferredName = buildSkillName(startTitle, startUrl, session.id);
-  const name = session.metadata.skillName || inferredName;
-  const description =
-    session.metadata.skillDescription || buildSkillDescription(startTitle, startUrl, steps);
-
-  return {
-    schemaVersion: SKILL_SCHEMA_VERSION,
-    skillId: session.id,
-    name,
-    description,
-    startUrl,
-    startTitle,
-    createdAt: session.startedAt,
-    startedAt: session.startedAt,
-    stoppedAt: session.stoppedAt,
-    recorderVersion: session.metadata.recorderVersion,
-    timezone: session.metadata.timezone,
-    userAgent: session.metadata.userAgent,
-    exportFormat: "skill-package",
-  };
-}
-
-function buildSkillIndex(session, meta, steps, rawEvents) {
-  return {
-    schemaVersion: SKILL_SCHEMA_VERSION,
-    skillId: session.id,
-    name: meta.name,
-    description: meta.description,
-    startUrl: meta.startUrl,
-    startTitle: meta.startTitle,
-    counts: {
-      tabs: Object.keys(session.tabs).length,
-      rawEvents: rawEvents.length,
-      steps: steps.length,
-    },
-    steps: steps.map((step) => ({
-      id: step.id,
-      type: step.type,
-      tip: step.tip,
-      stepFile: step.stepFile,
-      rawEventIds: step.rawEventIds,
-      timestamp: step.timestamp,
-      tabId: step.tabId ?? null,
-      url: step.url ?? "",
-      title: step.title ?? "",
-    })),
-  };
-}
-
-function buildStepMarkdown(meta, steps) {
-  const lines = [
-    `# ${meta.name}`,
-    "",
-    `Description: ${meta.description}`,
-    `Start URL: ${meta.startUrl || "N/A"}`,
-    `Start Title: ${meta.startTitle || "N/A"}`,
-    "",
-    "## Steps",
-  ];
-
-  if (steps.length === 0) {
-    lines.push("", "No normalized steps were generated from this recording.");
-    return lines.join("\n");
-  }
-
-  for (const [index, step] of steps.entries()) {
-    lines.push(`${index + 1}. [${step.id}] ${step.tip}`);
-  }
-
-  lines.push("", "Use index.json for machine-readable lookup and raw/ for low-level event details.");
-  return lines.join("\n");
-}
-
-function buildSkillFolderName(meta, sessionId) {
-  return sanitizeFileNameComponent(meta.name || `Browser Skill ${sessionId.slice(0, 8)}`);
-}
-
-function buildSkillName(startTitle, startUrl, sessionId) {
-  if (startTitle) {
-    return truncateText(startTitle, 80);
-  }
-
-  try {
-    const url = new URL(startUrl);
-    return `Skill for ${url.hostname}`;
-  } catch {
-    return `Browser Skill ${sessionId.slice(0, 8)}`;
-  }
-}
-
-function buildSkillDescription(startTitle, startUrl, steps) {
-  const subject = startTitle || startUrl || "the target website";
-  return `Recorded browser skill for ${subject}, containing ${steps.length} normalized steps.`;
-}
-
-function describeElementForTip(element) {
-  if (!element) {
-    return "the current element";
-  }
-
-  const candidates = [element.ariaLabel, element.placeholder, element.name, element.text, element.selector].filter(Boolean);
-
-  if (candidates.length > 0) {
-    return `"${truncateText(candidates[0], 60)}"`;
-  }
-
-  return element.tagName ? `the ${element.tagName} element` : "the current element";
-}
-
-function describeTabForTip(session, tabId) {
-  const tabRecord = session.tabs[String(tabId)];
-  if (!tabRecord) {
-    return `#${tabId}`;
-  }
-
-  return tabRecord.lastKnownTitle || formatUrlForTip(tabRecord.lastKnownUrl) || `#${tabId}`;
-}
-
-function findTitleForTab(session, tabId) {
-  return session.tabs[String(tabId)]?.lastKnownTitle ?? "";
-}
-
-function findUrlForTab(session, tabId) {
-  return session.tabs[String(tabId)]?.lastKnownUrl ?? "";
-}
-
-function formatUrlForTip(url) {
-  if (!url) {
-    return "the current page";
-  }
-
-  try {
-    const parsed = new URL(url);
-    return `${parsed.hostname}${parsed.pathname === "/" ? "" : parsed.pathname}`;
-  } catch {
-    return truncateText(url, 80);
-  }
-}
-
-function slugify(value) {
-  return String(value)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48) || "browser-skill";
-}
-
-function cloneSerializable(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-
-function sanitizeFileNameComponent(value) {
-  const cleaned = String(value)
-    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/[. ]+$/g, "")
-    .slice(0, 120);
-
-  if (!cleaned) {
-    return "Browser Skill";
-  }
-
-  const reservedNames = new Set([
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    "COM1",
-    "COM2",
-    "COM3",
-    "COM4",
-    "COM5",
-    "COM6",
-    "COM7",
-    "COM8",
-    "COM9",
-    "LPT1",
-    "LPT2",
-    "LPT3",
-    "LPT4",
-    "LPT5",
-    "LPT6",
-    "LPT7",
-    "LPT8",
-    "LPT9",
-  ]);
-
-  if (reservedNames.has(cleaned.toUpperCase())) {
-    return `Skill ${cleaned}`;
-  }
-
-  return cleaned;
-}
-
-function normalizeUserText(value, maxLength) {
-  if (typeof value !== "string") {
-    return "";
-  }
-
-  return truncateText(value.trim(), maxLength) || "";
-}
 function createZipBlob(files) {
   const localParts = [];
   const centralParts = [];
@@ -1655,112 +1152,5 @@ async function downloadTextFile(content, fileName, mimeType) {
     filename: fileName,
     saveAs: true,
     conflictAction: "uniquify",
-  });
-}
-
-function parseModelJson(text) {
-  const direct = tryParseJson(text);
-  if (direct) {
-    return direct;
-  }
-
-  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fencedMatch) {
-    const parsed = tryParseJson(fencedMatch[1]);
-    if (parsed) {
-      return parsed;
-    }
-  }
-
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start !== -1 && end !== -1 && end > start) {
-    const parsed = tryParseJson(text.slice(start, end + 1));
-    if (parsed) {
-      return parsed;
-    }
-  }
-
-  throw new Error("Could not parse JSON from LLM response.");
-}
-
-function tryParseJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function validateGeneratedSkill(skill) {
-  const requiredStrings = ["name", "description", "goal", "startUrl"];
-  for (const key of requiredStrings) {
-    if (typeof skill?.[key] !== "string") {
-      throw new Error(`Generated skill is missing required string field: ${key}`);
-    }
-  }
-
-  const requiredArrays = ["prerequisites", "steps", "assertions", "fallback", "notes"];
-  for (const key of requiredArrays) {
-    if (!Array.isArray(skill?.[key])) {
-      throw new Error(`Generated skill is missing required array field: ${key}`);
-    }
-  }
-}
-
-function renderGeneratedSkillMarkdown(skill) {
-  const lines = [
-    `# ${skill.name}`,
-    "",
-    skill.description,
-    "",
-    `Goal: ${skill.goal}`,
-    `Start URL: ${skill.startUrl || "N/A"}`,
-    "",
-    "## Prerequisites",
-    ...renderMarkdownList(skill.prerequisites),
-    "",
-    "## Steps",
-    ...renderGeneratedSkillSteps(skill.steps),
-    "",
-    "## Assertions",
-    ...renderMarkdownList(skill.assertions),
-    "",
-    "## Fallback",
-    ...renderMarkdownList(skill.fallback),
-    "",
-    "## Notes",
-    ...renderMarkdownList(skill.notes),
-  ];
-
-  return lines.join("\n");
-}
-
-function renderMarkdownList(items) {
-  if (!items || items.length === 0) {
-    return ["- None"];
-  }
-
-  return items.map((item) => `- ${String(item)}`);
-}
-
-function renderGeneratedSkillSteps(steps) {
-  if (!steps || steps.length === 0) {
-    return ["1. No steps generated"];
-  }
-
-  return steps.map((step, index) => {
-    const parts = [step.action || step.title || `Step ${index + 1}`];
-    if (step.target) {
-      parts.push(`Target: ${step.target}`);
-    }
-    if (step.value) {
-      parts.push(`Value: ${step.value}`);
-    }
-    if (step.expected) {
-      parts.push(`Expected: ${step.expected}`);
-    }
-
-    return `${index + 1}. ${parts.join(" | ")}`;
   });
 }

@@ -83,6 +83,8 @@ skill-name-1a2b3c4d/
   - tab 关闭
   - window focus 切换
 - 导出为分层 skill package，而不是单个大 JSON
+- 生成 LLM prompt 时会优先选择和归一化步骤相关的 `raw` 事件，而不是固定截取前几条
+- popup 支持发送前 `Prompt Preview` 和默认开启的 `Safe Mode`
 
 ## 安装方式
 
@@ -129,7 +131,8 @@ skill-name-1a2b3c4d/
    - `API Key`
    - `Model`
 3. 点击 `Generate Skill`
-4. 生成结果会显示在 popup 的 `Generated Preview`
+4. 先检查 popup 中的 `Prompt Preview`
+5. 生成结果会显示在 popup 的 `Generated Preview`
 5. 也可以直接下载：
    - `Download JSON`
    - `Download Markdown`
@@ -138,6 +141,7 @@ skill-name-1a2b3c4d/
 
 - `Base URL` 采用 OpenAI 风格接口，脚本会自动补成 `/chat/completions`
 - `API Key` 和 `Model` 会保存在扩展本地存储中，方便下次继续使用
+- `Safe Mode` 默认开启，会对 prompt 中的 query 参数、敏感输入值、请求头和 `postDataPreview` 做保守脱敏
 
 ### 使用本地 CLI
 
@@ -167,13 +171,28 @@ node scripts/generate-skill.js --input .\path\to\exported-skill-folder
 node scripts/generate-skill.js --input .\path\to\exported-skill-folder --dry-run
 ```
 
+## 开发验证
+
+语法检查：
+
+```powershell
+npm run check
+```
+
+共享逻辑测试：
+
+```powershell
+npm test
+```
+
 ## 已知限制
 
 - 无法录制 `chrome://`、Chrome Web Store、扩展页等受限页面
 - 当前仍会保留完整原始事件，长会话会生成较多 `raw/*.json`
+- prompt 预览和发送给 LLM 的上下文会做安全脱敏，但导出的 `raw/*.json` 仍保留原始录制内容
 - 当前 `name` 和 `description` 由起始页面信息自动推断，后续可以再补手动编辑能力
 - 如果在开始录制前填写了 `Skill Name` 和 `Skill Purpose`，导出时会优先使用你的输入
-- 当前未实现“网络事件和步骤”的强关联，只是把网络细节保存在 `raw/`
+- 当前只实现了轻量的“动作 -> 导航/状态”关联，复杂业务结果仍然需要进一步归一化
 - 当前对密码输入会写入 `[REDACTED]`
 
 ## 下一步建议

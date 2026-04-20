@@ -81,6 +81,35 @@ h1 {
   gap: 6px;
 }
 
+.toggleField {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.toggleCopy {
+  display: grid;
+  gap: 4px;
+}
+
+.toggleHint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.toggleControl {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
 .fieldLabel {
   color: var(--muted);
   font-size: 12px;
@@ -260,6 +289,12 @@ h1 {
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.previewMeta {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 @keyframes spin {

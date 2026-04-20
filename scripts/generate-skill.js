@@ -2,6 +2,11 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  parseModelJson,
+  renderGeneratedSkillMarkdown,
+  validateGeneratedSkill,
+} = require("../lib/generation-utils.js");
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -64,10 +69,10 @@ async function main() {
   });
 
   const skill = parseModelJson(responseText);
-  validateSkill(skill);
+  validateGeneratedSkill(skill);
 
   fs.writeFileSync(path.join(outputDir, "skill.json"), `${JSON.stringify(skill, null, 2)}\n`);
-  fs.writeFileSync(path.join(outputDir, "skill.md"), `${renderSkillMarkdown(skill)}\n`);
+  fs.writeFileSync(path.join(outputDir, "skill.md"), `${renderGeneratedSkillMarkdown(skill)}\n`);
   fs.writeFileSync(path.join(outputDir, "llm-response.txt"), `${responseText}\n`);
 
   console.log(`Generated skill files in ${outputDir}`);
@@ -203,113 +208,6 @@ function buildChatCompletionsUrl(baseUrl) {
   }
 
   return `${trimmed}/chat/completions`;
-}
-
-function parseModelJson(text) {
-  const direct = tryParseJson(text);
-  if (direct) {
-    return direct;
-  }
-
-  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fencedMatch) {
-    const parsed = tryParseJson(fencedMatch[1]);
-    if (parsed) {
-      return parsed;
-    }
-  }
-
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start !== -1 && end !== -1 && end > start) {
-    const parsed = tryParseJson(text.slice(start, end + 1));
-    if (parsed) {
-      return parsed;
-    }
-  }
-
-  throw new Error("Could not parse JSON from LLM response.");
-}
-
-function tryParseJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function validateSkill(skill) {
-  const requiredStringKeys = ["name", "description", "goal", "startUrl"];
-  for (const key of requiredStringKeys) {
-    if (typeof skill?.[key] !== "string") {
-      throw new Error(`Generated skill is missing required string field: ${key}`);
-    }
-  }
-
-  const requiredArrayKeys = ["prerequisites", "steps", "assertions", "fallback", "notes"];
-  for (const key of requiredArrayKeys) {
-    if (!Array.isArray(skill?.[key])) {
-      throw new Error(`Generated skill is missing required array field: ${key}`);
-    }
-  }
-}
-
-function renderSkillMarkdown(skill) {
-  const lines = [
-    `# ${skill.name}`,
-    "",
-    skill.description,
-    "",
-    `Goal: ${skill.goal}`,
-    `Start URL: ${skill.startUrl || "N/A"}`,
-    "",
-    "## Prerequisites",
-    ...renderList(skill.prerequisites),
-    "",
-    "## Steps",
-    ...renderSteps(skill.steps),
-    "",
-    "## Assertions",
-    ...renderList(skill.assertions),
-    "",
-    "## Fallback",
-    ...renderList(skill.fallback),
-    "",
-    "## Notes",
-    ...renderList(skill.notes),
-  ];
-
-  return lines.join("\n");
-}
-
-function renderList(items) {
-  if (!items || items.length === 0) {
-    return ["- None"];
-  }
-
-  return items.map((item) => `- ${String(item)}`);
-}
-
-function renderSteps(steps) {
-  if (!steps || steps.length === 0) {
-    return ["1. No steps generated"];
-  }
-
-  return steps.map((step, index) => {
-    const parts = [step.action || step.title || `Step ${index + 1}`];
-    if (step.target) {
-      parts.push(`Target: ${step.target}`);
-    }
-    if (step.value) {
-      parts.push(`Value: ${step.value}`);
-    }
-    if (step.expected) {
-      parts.push(`Expected: ${step.expected}`);
-    }
-
-    return `${index + 1}. ${parts.join(" | ")}`;
-  });
 }
 
 main().catch((error) => {

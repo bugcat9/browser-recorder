@@ -8,7 +8,10 @@ const skillDescriptionInput = document.getElementById("skillDescriptionInput");
 const llmBaseUrlInput = document.getElementById("llmBaseUrlInput");
 const llmApiKeyInput = document.getElementById("llmApiKeyInput");
 const llmModelInput = document.getElementById("llmModelInput");
+const safeModeInput = document.getElementById("safeModeInput");
 const generatedOutput = document.getElementById("generatedOutput");
+const promptPreviewOutput = document.getElementById("promptPreviewOutput");
+const promptPreviewMeta = document.getElementById("promptPreviewMeta");
 const generationStatus = document.getElementById("generationStatus");
 const generationStatusText = document.getElementById("generationStatusText");
 const generationError = document.getElementById("generationError");
@@ -45,6 +48,7 @@ generateButton.addEventListener("click", () =>
       baseUrl: llmBaseUrlInput.value.trim(),
       apiKey: llmApiKeyInput.value.trim(),
       model: llmModelInput.value.trim(),
+      safeMode: safeModeInput.checked,
     }
   )
 );
@@ -60,17 +64,26 @@ downloadMarkdownButton.addEventListener("click", () =>
   });
 });
 
+safeModeInput.addEventListener("input", () => {
+  void persistDraft();
+  updateActionAvailability(lastResponse);
+  void refreshPromptPreview();
+});
+
 let lastResponse = null;
 let localGenerationInProgress = false;
 let allowGenerationIndicator = false;
+let promptPreviewRequestId = 0;
 
 document.addEventListener("DOMContentLoaded", () => {
   void initializePopup();
 });
 
 async function initializePopup() {
-  await loadDraft();
   await refreshStatus();
+  await loadDraft();
+  updateActionAvailability(lastResponse);
+  await refreshPromptPreview();
 }
 
 async function execute(type, successMessage, payload = undefined) {
@@ -125,6 +138,7 @@ function renderState(response) {
   renderLlmState(response.llmSettings, response.generatedSkill, response.generationError);
   renderGenerationState(Boolean(response.summary?.generationInProgress));
   updateActionAvailability(response);
+  void refreshPromptPreview();
 }
 
 function renderSummary(summary) {
@@ -156,6 +170,10 @@ function renderLlmState(llmSettings, generatedSkill, lastGenerationError) {
     llmModelInput.value = llmSettings?.model || "gpt-4.1-mini";
   }
 
+  if (document.activeElement !== safeModeInput) {
+    safeModeInput.checked = llmSettings?.safeMode !== false;
+  }
+
   generatedOutput.value = generatedSkill?.markdown || "";
   renderGenerationError(lastGenerationError);
 }
@@ -176,6 +194,7 @@ function updateActionAvailability(response) {
   llmBaseUrlInput.disabled = visualGenerationInProgress;
   llmApiKeyInput.disabled = visualGenerationInProgress;
   llmModelInput.disabled = visualGenerationInProgress;
+  safeModeInput.disabled = visualGenerationInProgress;
 }
 
 function renderGenerationState(isGenerating) {
@@ -196,6 +215,47 @@ function setMessage(value) {
   message.textContent = value;
 }
 
+async function refreshPromptPreview() {
+  const requestId = ++promptPreviewRequestId;
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "GET_PROMPT_PREVIEW",
+      payload: {
+        safeMode: safeModeInput.checked,
+      },
+    });
+
+    if (requestId !== promptPreviewRequestId) {
+      return;
+    }
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Failed to build prompt preview.");
+    }
+
+    renderPromptPreview(response.promptPreview);
+  } catch (error) {
+    if (requestId !== promptPreviewRequestId) {
+      return;
+    }
+
+    renderPromptPreview({
+      rawCount: 0,
+      stepCount: 0,
+      previewText: error.message,
+      safeMode: safeModeInput.checked,
+    });
+  }
+}
+
+function renderPromptPreview(promptPreview) {
+  promptPreviewOutput.value = promptPreview?.previewText || "";
+  promptPreviewMeta.textContent = promptPreview
+    ? `${promptPreview.stepCount || 0} steps, ${promptPreview.rawCount || 0} raw events, ${promptPreview.safeMode ? "safe mode on" : "safe mode off"}`
+    : "Preview unavailable.";
+}
+
 async function loadDraft() {
   const stored = await chrome.storage.local.get(POPUP_DRAFT_KEY);
   const draft = stored?.[POPUP_DRAFT_KEY];
@@ -208,6 +268,7 @@ async function loadDraft() {
   llmBaseUrlInput.value = draft.baseUrl || "";
   llmApiKeyInput.value = draft.apiKey || "";
   llmModelInput.value = draft.model || "";
+  safeModeInput.checked = draft.safeMode !== false;
 }
 
 async function persistDraft() {
@@ -218,6 +279,7 @@ async function persistDraft() {
       baseUrl: llmBaseUrlInput.value,
       apiKey: llmApiKeyInput.value,
       model: llmModelInput.value,
+      safeMode: safeModeInput.checked,
     },
   });
 }

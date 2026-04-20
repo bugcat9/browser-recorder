@@ -75,6 +75,14 @@
             </label>
           </div>
 
+          <label class="toggleField" for="safeModeInput">
+            <span class="toggleCopy">
+              <span class="fieldLabel">Safe Mode</span>
+              <span class="toggleHint">Redact sensitive values in the prompt preview and LLM request.</span>
+            </span>
+            <input id="safeModeInput" class="toggleControl" type="checkbox" checked />
+          </label>
+
           <div class="actions">
             <button id="generateButton" class="button primary">Generate Skill</button>
             <button id="downloadJsonButton" class="button">Download JSON</button>
@@ -91,6 +99,12 @@
             <p id="generationErrorMessage" class="generationErrorMessage"></p>
             <p id="generationErrorHint" class="generationErrorHint"></p>
           </div>
+
+          <label class="field outputField">
+            <span class="fieldLabel">Prompt Preview</span>
+            <span id="promptPreviewMeta" class="previewMeta">Preview unavailable.</span>
+            <textarea id="promptPreviewOutput" class="fieldControl fieldControlTextarea outputControl" readonly></textarea>
+          </label>
 
           <label class="field outputField">
             <span class="fieldLabel">Generated Preview</span>

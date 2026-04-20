@@ -3,7 +3,8 @@
   "version": "0.2.0",
   "private": true,
   "scripts": {
-    "check": "node --check background.js && node --check content-script.js && node --check popup.js && node --check scripts/generate-skill.js",
-    "generate:skill": "node scripts/generate-skill.js"
+    "check": "node --check background.js && node --check content-script.js && node --check popup.js && node --check scripts/generate-skill.js && node --check lib/common.js && node --check lib/steps.js && node --check lib/prompt-privacy.js && node --check lib/skill-package.js && node --check lib/generation-utils.js",
+    "generate:skill": "node scripts/generate-skill.js",
+    "test": "node --test tests/*.test.js"
   }
 }
